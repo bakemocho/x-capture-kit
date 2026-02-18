@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>x-clipper logs</title>
+    <link rel="stylesheet" href="logs.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="top">
+        <h1>x-clipper logs</h1>
+        <div class="controls">
+          <label class="check">
+            <input id="includeArchived" type="checkbox" />
+            <span>Include archived</span>
+          </label>
+          <button id="reloadButton" type="button">Reload</button>
+        </div>
+      </header>
+
+      <p id="statusMessage" class="status" role="status" aria-live="polite"></p>
+      <section id="listRoot" class="list"></section>
+      <div class="more-wrap">
+        <button id="loadMoreButton" type="button" class="secondary" hidden>Load more</button>
+      </div>
+    </main>
+
+    <script src="logs.js"></script>
+  </body>
+</html>

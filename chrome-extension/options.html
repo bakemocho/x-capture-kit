@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>x-clipper options</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>x-clipper options</h1>
+
+      <section class="card">
+        <h2>Collector</h2>
+        <label class="field">
+          <span>Ingest URL</span>
+          <input id="ingestUrl" type="url" placeholder="http://127.0.0.1:18765/ingest" />
+        </label>
+        <label class="field">
+          <span>Ingest Token (optional)</span>
+          <input id="ingestToken" type="password" placeholder="token" />
+        </label>
+      </section>
+
+      <section class="card">
+        <h2>Capture Tags</h2>
+        <p class="help">
+          Tag format: letters/numbers/underscore/hyphen only. Spaces are converted to underscore.
+        </p>
+        <label class="field">
+          <span>Available Tags (comma or newline separated)</span>
+          <textarea id="availableTags" rows="4" placeholder="research&#10;ai&#10;personal"></textarea>
+        </label>
+        <label class="field">
+          <span>Default Tags (used when picker is OFF / initial selection when ON)</span>
+          <textarea id="defaultTags" rows="3" placeholder="research"></textarea>
+        </label>
+        <label class="field inline-check">
+          <input id="promptTagsOnCapture" type="checkbox" />
+          <span>Show tag picker on every capture</span>
+        </label>
+      </section>
+
+      <footer class="actions">
+        <button id="saveButton" type="button">Save</button>
+        <button id="resetButton" type="button" class="secondary">Reset</button>
+        <a href="logs.html" target="_blank" rel="noopener noreferrer" class="button-link secondary"
+          >Open Logs</a
+        >
+        <span id="statusMessage" role="status" aria-live="polite"></span>
+      </footer>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>
