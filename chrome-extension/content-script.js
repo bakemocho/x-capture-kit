@@ -18,6 +18,9 @@ const LOOKUP_DEBOUNCE_MS = 700;
 const POSITIVE_CACHE_TTL_MS = 10 * 60 * 1000;
 const NEGATIVE_CACHE_TTL_MS = 45 * 1000;
 const LOOKUP_ERROR_COOLDOWN_MS = 30 * 1000;
+const RUNTIME_SEND_RETRY_DELAY_MS = 220;
+const RUNTIME_SEND_MAX_ATTEMPTS = 2;
+const CONTENT_SCRIPT_BUILD = "2026-02-19.2";
 
 const MARKER_CLASS = "x-clipper-saved-marker";
 const MARKER_STYLE_ID = "x-clipper-saved-marker-style";
@@ -41,6 +44,121 @@ function asErrorMessage(error) {
     return error.message;
   }
   return String(error);
+}
+
+function isRuntimeUnavailableError(error) {
+  if (!error) {
+    return false;
+  }
+  const code = error && error.code ? String(error.code) : "";
+  if (code === "runtime_unavailable") {
+    return true;
+  }
+  const message = asErrorMessage(error);
+  return (
+    message.includes("Extension context invalidated") ||
+    message.includes("Cannot read properties of undefined (reading 'sendMessage')") ||
+    message.includes("Cannot read property 'sendMessage' of undefined")
+  );
+}
+
+function isRuntimeUnavailableMessage(text) {
+  const message = String(text || "");
+  return (
+    message.includes("runtime_unavailable") ||
+    message.includes("Extension context invalidated") ||
+    message.includes("Cannot read properties of undefined (reading 'sendMessage')") ||
+    message.includes("Cannot read property 'sendMessage' of undefined")
+  );
+}
+
+function isRetryableRuntimeSendError(error) {
+  const code = error && error.code ? String(error.code) : "";
+  if (code === "runtime_no_response" || code === "runtime_last_error") {
+    return true;
+  }
+  const message = asErrorMessage(error);
+  return (
+    message.includes("The message port closed before a response was received") ||
+    message.includes("Could not establish connection") ||
+    message.includes("Receiving end does not exist")
+  );
+}
+
+function sleepRuntimeSend(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Math.trunc(ms || 0)));
+  });
+}
+
+function sendRuntimeMessageOnce(payload) {
+  const runtime =
+    typeof chrome === "object" && chrome ? chrome.runtime : null;
+  if (!runtime || typeof runtime.sendMessage !== "function") {
+    const error = new Error("runtime_unavailable");
+    error.code = "runtime_unavailable";
+    throw error;
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    try {
+      runtime.sendMessage(payload, (response) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        const lastError =
+          typeof chrome === "object" && chrome && chrome.runtime
+            ? chrome.runtime.lastError
+            : null;
+        if (lastError) {
+          const error = new Error(lastError.message || String(lastError));
+          error.code = "runtime_last_error";
+          reject(error);
+          return;
+        }
+        if (typeof response === "undefined") {
+          const error = new Error("runtime_no_response");
+          error.code = "runtime_no_response";
+          reject(error);
+          return;
+        }
+        resolve(response);
+      });
+    } catch (error) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    }
+  });
+}
+
+async function sendRuntimeMessage(payload, options) {
+  const requestedAttempts =
+    options && Number.isFinite(options.maxAttempts) ? Number(options.maxAttempts) : 1;
+  const maxAttempts = Math.max(1, Math.trunc(requestedAttempts));
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await sendRuntimeMessageOnce(payload);
+    } catch (error) {
+      lastError = error;
+      if (
+        attempt >= maxAttempts ||
+        isRuntimeUnavailableError(error) ||
+        !isRetryableRuntimeSendError(error)
+      ) {
+        throw error;
+      }
+      await sleepRuntimeSend(RUNTIME_SEND_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError || new Error("runtime_send_failed");
 }
 
 function normalizeTagValue(value) {
@@ -283,6 +401,7 @@ function openTagPickerDialog(options) {
   return new Promise((resolve) => {
     const tagOrder = [...availableTags];
     const selected = new Set(initialSelected.filter((tag) => tagOrder.includes(tag)));
+    let settled = false;
 
     const overlay = document.createElement("div");
     overlay.className = "x-clipper-tag-overlay";
@@ -407,6 +526,14 @@ function openTagPickerDialog(options) {
     }
 
     function finish(result) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      addInput.disabled = true;
+      addButton.disabled = true;
+      cancelButton.disabled = true;
+      saveButton.disabled = true;
       cleanup();
       resolve(result);
     }
@@ -652,16 +779,24 @@ function collectCapturedStatusIds(payload) {
 }
 
 function logLookupError(error) {
+  if (isRuntimeUnavailableError(error) || isRuntimeUnavailableMessage(error)) {
+    return;
+  }
   const now = Date.now();
   if (now - lastLookupErrorAt < LOOKUP_ERROR_COOLDOWN_MS) {
     return;
   }
   lastLookupErrorAt = now;
   // eslint-disable-next-line no-console
-  console.warn(`[x-clipper] seen lookup failed: ${asErrorMessage(error)}`);
+  console.warn(
+    `[x-clipper:${CONTENT_SCRIPT_BUILD}] seen lookup failed: ${asErrorMessage(error)}`
+  );
 }
 
 async function runSeenLookup() {
+  if (!isRuntimeReady()) {
+    return;
+  }
   if (lookupInFlight) {
     pendingRescan = true;
     return;
@@ -696,11 +831,14 @@ async function runSeenLookup() {
     for (const batch of batches) {
       let response;
       try {
-        response = await chrome.runtime.sendMessage({
+        response = await sendRuntimeMessage({
           type: "x_clipper_seen_lookup",
           status_ids: batch,
         });
       } catch (error) {
+        if (isRuntimeUnavailableError(error)) {
+          return;
+        }
         logLookupError(`runtime_send_failed:${asErrorMessage(error)}`);
         return;
       }
@@ -740,6 +878,9 @@ async function runSeenLookup() {
 }
 
 function scheduleSeenLookup(delayMs) {
+  if (!isRuntimeReady()) {
+    return;
+  }
   if (lookupTimer) {
     clearTimeout(lookupTimer);
     lookupTimer = null;
@@ -751,6 +892,12 @@ function scheduleSeenLookup(delayMs) {
       logLookupError(error);
     });
   }, delay);
+}
+
+function isRuntimeReady() {
+  const runtime =
+    typeof chrome === "object" && chrome ? chrome.runtime : null;
+  return Boolean(runtime && typeof runtime.sendMessage === "function");
 }
 
 function setupSeenMarkerObserver() {
@@ -807,11 +954,13 @@ window.addEventListener("message", async (event) => {
   let result;
   try {
     relayPayload = await applyCaptureTagSelection(relayPayload);
-    result = await chrome.runtime.sendMessage({
+    result = await sendRuntimeMessage({
       type: "x_clipper_capture_request",
       request_id: requestId,
       page_url: data.page_url || window.location.href,
       payload: relayPayload,
+    }, {
+      maxAttempts: RUNTIME_SEND_MAX_ATTEMPTS,
     });
   } catch (error) {
     const code = error && error.code ? String(error.code) : "";
@@ -821,6 +970,12 @@ window.addEventListener("message", async (event) => {
         cancelled: true,
         error: "capture_cancelled",
       };
+    } else if (isRuntimeUnavailableError(error)) {
+      result = {
+        ok: false,
+        cancelled: false,
+        error: "runtime_unavailable",
+      };
     } else {
       result = {
         ok: false,
@@ -828,6 +983,19 @@ window.addEventListener("message", async (event) => {
         error: `runtime_send_failed:${asErrorMessage(error)}`,
       };
     }
+  }
+
+  if (!result || typeof result !== "object") {
+    result = {
+      ok: false,
+      cancelled: false,
+      error: "runtime_empty_response",
+    };
+  } else if (!result.ok && !result.cancelled && !result.error) {
+    result = {
+      ...result,
+      error: "runtime_empty_response",
+    };
   }
 
   if (result && result.ok && relayPayload && typeof relayPayload === "object") {

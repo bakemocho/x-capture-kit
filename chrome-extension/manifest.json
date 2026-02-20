@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "x-clipper relay",
-  "version": "0.2.0",
+  "version": "0.2.5",
   "description": "Capture tweet JSON from x.com and relay it to a local ingest endpoint.",
   "icons": {
     "16": "icons/icon-16.png",

@@ -7,9 +7,9 @@
   const RESPONSE_SOURCE = "x-clipper-extension";
   const REQUEST_TYPE = "X_CLIPPER_CAPTURE_REQUEST";
   const RESPONSE_TYPE = "X_CLIPPER_CAPTURE_RESPONSE";
-  const RESPONSE_TIMEOUT_MS = 5000;
+  const RESPONSE_TIMEOUT_MS = 180000;
 
-  if (window[BRIDGE_FLAG]) {
+  if (window[BRIDGE_FLAG] && typeof window[HOOK_KEY] === "function") {
     return;
   }
   window[BRIDGE_FLAG] = true;
@@ -73,12 +73,17 @@
     );
 
     const response = await responsePromise;
+    const ok = Boolean(response && response.ok);
     const cancelled = Boolean(response && response.cancelled);
+    let error = response && response.error ? String(response.error) : null;
+    if (!ok && !cancelled && !error) {
+      error = "extension_no_response_payload";
+    }
     return {
-      ok: Boolean(response && response.ok),
+      ok,
       cancelled,
-      skip_clipboard: Boolean(response && response.ok),
-      error: response && response.error ? String(response.error) : null,
+      skip_clipboard: ok,
+      error,
       transport: response && response.transport ? response.transport : null,
       tags: response && Array.isArray(response.tags) ? response.tags : null,
     };

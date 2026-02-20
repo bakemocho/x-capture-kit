@@ -6,3 +6,9 @@ node_modules/
 
 # Build outputs
 *.log
+
+# Xcode user-specific files
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserdatad/
+*.xcuserstate

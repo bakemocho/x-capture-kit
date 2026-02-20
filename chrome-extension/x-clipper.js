@@ -19,6 +19,25 @@
     /このポストにはミュートしたキーワードが含まれています|このポストにはミュートしたワードが含まれています|This post contains muted words/i;
   const X_HOST_PATTERN = /^(?:x|twitter)\.com$/i;
   const STATUS_DETAIL_PATH_PATTERN = /^\/(?:i\/web\/status|[A-Za-z0-9_]{1,20}\/status)\/\d+(?:[/?#]|$)/i;
+  const RUN_LOCK_KEY = "__X_CLIPPER_CAPTURE_RUN_LOCK__";
+  const RUN_LOCK_STALE_MS = 3 * 60 * 1000;
+  const RELAY_REQUEST_SOURCE = "x-clipper-page";
+  const RELAY_RESPONSE_SOURCE = "x-clipper-extension";
+  const RELAY_REQUEST_TYPE = "X_CLIPPER_CAPTURE_REQUEST";
+  const RELAY_RESPONSE_TYPE = "X_CLIPPER_CAPTURE_RESPONSE";
+  const DIRECT_RELAY_TIMEOUT_MS = 180000;
+  let initialStateObjectCache;
+  let initialStatePayloadIndexCache;
+
+  function isRuntimeUnavailableRelayError(message) {
+    const text = String(message || "");
+    return (
+      text.includes("runtime_unavailable") ||
+      text.includes("Extension context invalidated") ||
+      text.includes("Cannot read properties of undefined (reading 'sendMessage')") ||
+      text.includes("Cannot read property 'sendMessage' of undefined")
+    );
+  }
 
   function normalizeWhitespace(input) {
     return (input || "")
@@ -364,6 +383,171 @@
     return payloads;
   }
 
+  function extractAssignedObjectLiteral(source, assignmentMarker) {
+    const markerIndex = source.indexOf(assignmentMarker);
+    if (markerIndex < 0) {
+      return null;
+    }
+    let index = markerIndex + assignmentMarker.length;
+    while (index < source.length && /\s/.test(source[index])) {
+      index += 1;
+    }
+    if (source[index] !== "{") {
+      return null;
+    }
+
+    let depth = 0;
+    let quote = null;
+    let escaped = false;
+    for (let i = index; i < source.length; i += 1) {
+      const ch = source[i];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (ch === "\"" || ch === "'" || ch === "`") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "{") {
+        depth += 1;
+        continue;
+      }
+      if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return source.slice(index, i + 1);
+        }
+      }
+    }
+    return null;
+  }
+
+  function getInitialStateObject() {
+    if (initialStateObjectCache !== undefined) {
+      return initialStateObjectCache;
+    }
+
+    let parsed = null;
+    try {
+      const direct =
+        typeof window.__INITIAL_STATE__ === "object" && window.__INITIAL_STATE__
+          ? window.__INITIAL_STATE__
+          : null;
+      if (direct && typeof direct === "object") {
+        parsed = direct;
+      }
+    } catch (_error) {
+      parsed = null;
+    }
+
+    if (!parsed) {
+      const scripts = Array.from(document.querySelectorAll("script"));
+      for (const script of scripts) {
+        const text = String(script.textContent || "");
+        if (!text.includes("window.__INITIAL_STATE__")) {
+          continue;
+        }
+        const objectLiteral = extractAssignedObjectLiteral(
+          text,
+          "window.__INITIAL_STATE__ ="
+        );
+        if (!objectLiteral) {
+          continue;
+        }
+        try {
+          parsed = JSON.parse(objectLiteral);
+          break;
+        } catch (_error) {
+          parsed = null;
+        }
+      }
+    }
+
+    initialStateObjectCache = parsed || null;
+    return initialStateObjectCache;
+  }
+
+  function collectInitialStateTweetEntityValues(initialState) {
+    const entities =
+      initialState && typeof initialState === "object"
+        ? safeGetIn(initialState, ["entities", "tweets", "entities"])
+        : null;
+    if (!entities || typeof entities !== "object") {
+      return [];
+    }
+
+    const out = [];
+    for (const key of safeOwnKeys(entities)) {
+      const value = safeGet(entities, key);
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      out.push(value);
+      const result = safeGet(value, "result");
+      if (result && typeof result === "object") {
+        out.push(result);
+      }
+      const nestedTweet = safeGetIn(value, ["tweet", "result"]);
+      if (nestedTweet && typeof nestedTweet === "object") {
+        out.push(nestedTweet);
+      }
+    }
+    return out;
+  }
+
+  function getInitialStatePayloadIndex() {
+    if (initialStatePayloadIndexCache !== undefined) {
+      return initialStatePayloadIndexCache;
+    }
+
+    const initialState = getInitialStateObject();
+    if (!initialState) {
+      initialStatePayloadIndexCache = null;
+      return null;
+    }
+
+    const summaries = [];
+    const signalUrls = [];
+    const values = collectInitialStateTweetEntityValues(initialState);
+    for (const value of values) {
+      try {
+        const signals = collectStatusSignalsFromValue(value);
+        signalUrls.push(...signals.urls);
+      } catch (_error) {
+        // ignore malformed payload fragments
+      }
+      try {
+        summaries.push(...collectTweetNodeSummaries(value));
+      } catch (_error) {
+        // ignore malformed payload fragments
+      }
+    }
+
+    if (summaries.length === 0) {
+      initialStatePayloadIndexCache = null;
+      return null;
+    }
+
+    const bestByStatus = buildBestSummaryByStatus(summaries);
+    const statusInfoById = buildStatusInfoById(bestByStatus, signalUrls);
+    initialStatePayloadIndexCache = {
+      best_by_status: bestByStatus,
+      status_info_by_id: statusInfoById,
+    };
+    return initialStatePayloadIndexCache;
+  }
+
   function collectStatusSignalsFromValue(seedValue) {
     const urlCandidates = [];
     const statusIds = [];
@@ -483,7 +667,7 @@
     return scored[0].url;
   }
 
-  function inferStatusFromReactPayload(root, preferredHandle) {
+  function inferStatusFromReactPayload(root, preferredHandle, excludedStatusId) {
     const payloads = collectReactPayloads(root);
     if (payloads.length === 0) {
       return {
@@ -511,12 +695,33 @@
       }
     }
 
-    const pickedUrl = pickBestStatusUrl(uniq(urlCandidates), preferredHandle);
+    const excludedId = normalizeStatusId(excludedStatusId);
+    const candidateUrls = uniq(urlCandidates).filter((url) => {
+      if (!excludedId) {
+        return true;
+      }
+      return parseStatusId(url) !== excludedId;
+    });
+    const candidateStatusIds = uniq(statusIds).filter((statusId) => {
+      if (!excludedId) {
+        return true;
+      }
+      return statusId !== excludedId;
+    });
+
+    const pickedUrl = pickBestStatusUrl(candidateUrls, preferredHandle);
     let statusId = pickedUrl ? parseStatusId(pickedUrl) : null;
     let statusUrl = pickedUrl;
 
-    if (!statusId && statusIds.length > 0) {
-      statusId = statusIds.sort((a, b) => b.length - a.length)[0];
+    if (!statusId && candidateStatusIds.length > 0) {
+      statusId = candidateStatusIds.sort((a, b) => b.length - a.length)[0];
+    }
+
+    if (excludedId && statusId === excludedId) {
+      statusId = null;
+    }
+    if (statusUrl && excludedId && parseStatusId(statusUrl) === excludedId) {
+      statusUrl = null;
     }
 
     if (!statusUrl && statusId) {
@@ -971,10 +1176,6 @@
 
   function collectPayloadSummaryAndStatusIndex(article) {
     const payloads = collectReactPayloads(article);
-    if (payloads.length === 0) {
-      return null;
-    }
-
     const summaries = [];
     const signalUrls = [];
     for (const payload of payloads) {
@@ -991,12 +1192,47 @@
       }
     }
 
+    const initialStateIndex = getInitialStatePayloadIndex();
+    if (initialStateIndex && summaries.length <= 1) {
+      for (const summary of initialStateIndex.best_by_status.values()) {
+        summaries.push(summary);
+      }
+      for (const info of initialStateIndex.status_info_by_id.values()) {
+        if (info && info.status_url) {
+          signalUrls.push(info.status_url);
+        }
+      }
+    }
+
     if (summaries.length === 0) {
       return null;
     }
 
     const bestByStatus = buildBestSummaryByStatus(summaries);
     const statusInfoById = buildStatusInfoById(bestByStatus, signalUrls);
+
+    if (initialStateIndex && bestByStatus.size <= 1) {
+      for (const [statusId, summary] of initialStateIndex.best_by_status.entries()) {
+        if (!bestByStatus.has(statusId)) {
+          bestByStatus.set(statusId, summary);
+        }
+      }
+      for (const [statusId, info] of initialStateIndex.status_info_by_id.entries()) {
+        if (!statusInfoById.has(statusId)) {
+          statusInfoById.set(statusId, info);
+          continue;
+        }
+        const current = statusInfoById.get(statusId);
+        if (current && info) {
+          if (!current.handle && info.handle) {
+            current.handle = info.handle;
+          }
+          if (!current.status_url && info.status_url) {
+            current.status_url = info.status_url;
+          }
+        }
+      }
+    }
 
     return {
       best_by_status: bestByStatus,
@@ -1591,7 +1827,34 @@
     };
   }
 
-  function extractArticleCardMeta(root, preferredHandle) {
+  function extractArticleStatusIdFromItem(item) {
+    if (!item || typeof item !== "object") {
+      return null;
+    }
+    const statusId =
+      normalizeStatusId(item.status_id) ||
+      parseStatusId(item.status_url || "") ||
+      parseArticleId(item.status_url || "") ||
+      normalizeStatusId(item.article && item.article.status_id) ||
+      parseStatusId((item.article && item.article.url) || "") ||
+      parseArticleId((item.article && item.article.url) || "");
+    return statusId || null;
+  }
+
+  function hasResolvableQuotedTarget(item, ownStatusId) {
+    if (!item || typeof item !== "object") {
+      return false;
+    }
+    const ownId = normalizeStatusId(ownStatusId);
+    const statusId = extractArticleStatusIdFromItem(item);
+    if (statusId) {
+      return !ownId || statusId !== ownId;
+    }
+    const articleUrl = firstString([item.article && item.article.url]);
+    return Boolean(articleUrl);
+  }
+
+  function extractArticleCardMeta(root, preferredHandle, ownStatusId) {
     const badge = root.querySelector('[aria-label="記事"], [aria-label="Article"]');
     if (!badge) {
       return null;
@@ -1643,7 +1906,7 @@
       break;
     }
 
-    const inferred = inferStatusFromReactPayload(root, preferredHandle);
+    const inferred = inferStatusFromReactPayload(root, preferredHandle, ownStatusId);
     if (!statusId && inferred.status_id) {
       statusId = inferred.status_id;
     }
@@ -1663,6 +1926,21 @@
       statusUrl = preferredHandle
         ? `https://x.com/${preferredHandle}/status/${statusId}`
         : `https://x.com/i/web/status/${statusId}`;
+    }
+
+    const ownId = normalizeStatusId(ownStatusId);
+    if (ownId && statusId === ownId) {
+      statusId = null;
+      statusUrl = null;
+    }
+    if (ownId && statusUrl && parseStatusId(statusUrl) === ownId) {
+      statusUrl = null;
+    }
+    if (ownId && url) {
+      const urlStatusId = parseStatusId(url) || parseArticleId(url);
+      if (urlStatusId === ownId) {
+        url = null;
+      }
     }
 
     if (!url) {
@@ -1752,10 +2030,16 @@
             url_unavailable_reason: firstString([item.article.url_unavailable_reason]) || null,
           }
         : null;
+    const inferredStatusId =
+      statusId ||
+      parseStatusId(statusUrl || "") ||
+      parseArticleId(statusUrl || "") ||
+      parseStatusId((articleMeta && articleMeta.url) || "") ||
+      parseArticleId((articleMeta && articleMeta.url) || "");
 
     return {
       type,
-      status_id: statusId || null,
+      status_id: inferredStatusId || null,
       status_url: statusUrl || null,
       author,
       text,
@@ -1891,6 +2175,24 @@
       if (!normalized) {
         return;
       }
+      const ownId = normalizeStatusId(ownStatusId);
+      if (ownId) {
+        const targetStatusId = extractArticleStatusIdFromItem(normalized);
+        if (targetStatusId === ownId) {
+          normalized.status_id = null;
+          normalized.status_url = null;
+          if (normalized.article && normalized.article.url) {
+            const articleStatusId =
+              parseStatusId(normalized.article.url) || parseArticleId(normalized.article.url);
+            if (articleStatusId === ownId) {
+              normalized.article.url = null;
+            }
+          }
+        }
+      }
+      if (!hasResolvableQuotedTarget(normalized, ownStatusId)) {
+        return;
+      }
       const dedupeKey = quotedItemDedupeKey(normalized);
       if (!dedupeKey) {
         return;
@@ -1908,7 +2210,11 @@
       let item = null;
       try {
         const quoteUser = extractUserInfo(root);
-        const articleMeta = extractArticleCardMeta(root, quoteUser && quoteUser.handle);
+        const articleMeta = extractArticleCardMeta(
+          root,
+          quoteUser && quoteUser.handle,
+          ownStatusId
+        );
         const statusInfo = pickStatusFromRoot(root, ownStatusId);
         let statusId = statusInfo.status_id;
         let statusUrl = statusInfo.status_url;
@@ -1953,12 +2259,8 @@
 
     const needsPayloadFallback =
       roots.length === 0 ||
-      items.every(
-        (item) =>
-          !item.status_id &&
-          !(item.article && item.article.url) &&
-          !(item.article && item.article.status_id)
-      );
+      items.length === 0 ||
+      items.every((item) => !hasResolvableQuotedTarget(item, ownStatusId));
     if (needsPayloadFallback) {
       const payloadItems = extractQuotedItemsFromReactPayload(article, ownStatusId);
       for (const payloadItem of payloadItems) {
@@ -2828,10 +3130,11 @@
 
   async function probePrimaryCandidateFromTop(expectedStatusId) {
     const safeExpectedStatusId = normalizeStatusId(expectedStatusId);
-    const previousY = window.scrollY || 0;
+    const scrollContainer = pickScrollContainer();
+    const previousY = getScrollTop(scrollContainer);
     try {
       if (previousY > 0) {
-        window.scrollTo(0, 0);
+        setScrollTop(scrollContainer, 0);
         await sleep(320);
       }
 
@@ -2869,27 +3172,30 @@
         : null;
     } finally {
       if (previousY > 0) {
-        window.scrollTo(0, previousY);
+        setScrollTop(scrollContainer, previousY);
       }
     }
   }
 
   async function probeContextByScrollingDownFromTop(expectedStatusId) {
-    const startY = window.scrollY || 0;
-    if (startY > 24) {
-      return {
-        used: false,
-        before_count: document.querySelectorAll(TWEET_SELECTOR).length,
-        after_count: document.querySelectorAll(TWEET_SELECTOR).length,
-        before_reply_count: 0,
-        after_reply_count: 0,
-      };
+    const scrollContainer = pickScrollContainer();
+    const initialTop = getScrollTop(scrollContainer);
+    if (initialTop > 24) {
+      setScrollTop(scrollContainer, 0);
+      await sleep(320);
     }
 
     const safeExpectedStatusId = normalizeStatusId(expectedStatusId);
     const beforeCount = document.querySelectorAll(TWEET_SELECTOR).length;
     const beforeCandidates = collectTweetCandidates(
       Array.from(document.querySelectorAll(TWEET_SELECTOR))
+    );
+    const seenCandidateByStatus = new Map();
+    for (const candidate of beforeCandidates) {
+      rememberBestCandidateByStatus(seenCandidateByStatus, candidate);
+    }
+    const seenStatusIds = new Set(
+      beforeCandidates.map((item) => String(item && item.status_id ? item.status_id : "")).filter(Boolean)
     );
     const beforeReplyCount = safeExpectedStatusId
       ? beforeCandidates.filter(
@@ -2901,18 +3207,31 @@
       : Math.max(0, beforeCandidates.length - 1);
 
     const maxSteps = 64;
-    const stepPixels = Math.max(Math.floor(window.innerHeight * 1.25), 1000);
+    const viewportHeight =
+      scrollContainer && Number.isFinite(scrollContainer.clientHeight) && scrollContainer.clientHeight > 0
+        ? scrollContainer.clientHeight
+        : window.innerHeight || 800;
+    const stepPixels = Math.max(Math.floor(viewportHeight * 1.25), 1000);
     let bestCount = beforeCount;
+    let bestStatusCount = seenStatusIds.size;
     let bestReplyCount = beforeReplyCount;
+    let bestScrollTop = getScrollTop(scrollContainer);
     let staleSteps = 0;
 
     for (let i = 0; i < maxSteps; i += 1) {
-      window.scrollBy(0, stepPixels);
+      const beforeStepScrollTop = getScrollTop(scrollContainer);
+      scrollByY(scrollContainer, stepPixels);
       await sleep(260);
       const count = document.querySelectorAll(TWEET_SELECTOR).length;
       const candidates = collectTweetCandidates(
         Array.from(document.querySelectorAll(TWEET_SELECTOR))
       );
+      for (const item of candidates) {
+        if (item && item.status_id) {
+          seenStatusIds.add(String(item.status_id));
+          rememberBestCandidateByStatus(seenCandidateByStatus, item);
+        }
+      }
       const replyCount = safeExpectedStatusId
         ? candidates.filter(
             (item) =>
@@ -2922,12 +3241,24 @@
           ).length
         : Math.max(0, candidates.length - 1);
 
-      const progressed = count > bestCount || replyCount > bestReplyCount;
+      const statusCount = seenStatusIds.size;
+      const currentScrollTop = getScrollTop(scrollContainer);
+      const progressed =
+        count > bestCount ||
+        statusCount > bestStatusCount ||
+        replyCount > bestReplyCount ||
+        currentScrollTop > beforeStepScrollTop + 2;
       if (count > bestCount) {
         bestCount = count;
       }
+      if (statusCount > bestStatusCount) {
+        bestStatusCount = statusCount;
+      }
       if (replyCount > bestReplyCount) {
         bestReplyCount = replyCount;
+      }
+      if (currentScrollTop > bestScrollTop) {
+        bestScrollTop = currentScrollTop;
       }
       if (progressed) {
         staleSteps = 0;
@@ -2938,7 +3269,7 @@
       if (safeExpectedStatusId && bestReplyCount >= 10) {
         break;
       }
-      if (!safeExpectedStatusId && bestCount >= 28) {
+      if (!safeExpectedStatusId && bestStatusCount >= 28) {
         break;
       }
       if (staleSteps >= 8 && i >= 12) {
@@ -2946,13 +3277,98 @@
       }
     }
 
+    if (Math.abs(getScrollTop(scrollContainer) - initialTop) > 2) {
+      setScrollTop(scrollContainer, initialTop);
+      await sleep(120);
+    }
+
     return {
-      used: (window.scrollY || 0) > startY,
+      used: bestScrollTop > 0,
+      scroll_container: describeScrollContainer(scrollContainer),
+      before_scroll_top: initialTop,
+      after_scroll_top: bestScrollTop,
       before_count: beforeCount,
       after_count: bestCount,
+      before_status_count: beforeCandidates.length,
+      after_status_count: bestStatusCount,
       before_reply_count: beforeReplyCount,
       after_reply_count: bestReplyCount,
+      seen_candidate_count: seenCandidateByStatus.size,
+      seen_candidates: Array.from(seenCandidateByStatus.values()),
     };
+  }
+
+  function candidateSignalScore(candidate) {
+    if (!candidate || typeof candidate !== "object") {
+      return 0;
+    }
+    let score = 0;
+    if (candidate.posted_at) {
+      score += 2;
+    }
+    if (candidate.author && candidate.author.handle) {
+      score += 1.2;
+    }
+    if (candidate.author && candidate.author.display_name) {
+      score += 0.8;
+    }
+    if (typeof candidate.text === "string" && candidate.text) {
+      score += Math.min(candidate.text.length, 600) / 60;
+    }
+    if (candidate.reply_to && (candidate.reply_to.status_id || candidate.reply_to.handle)) {
+      score += 6;
+    }
+    const metrics = candidate.metrics || null;
+    if (metrics && typeof metrics === "object") {
+      for (const key of ["replies", "reposts", "likes", "bookmarks", "views"]) {
+        const metric = metrics[key];
+        if (!metric || typeof metric !== "object") {
+          continue;
+        }
+        if (metric.raw) {
+          score += 1;
+        }
+        if (Number.isFinite(metric.count)) {
+          score += 0.8;
+        }
+      }
+    }
+    if (Array.isArray(candidate.links) && candidate.links.length > 0) {
+      score += Math.min(candidate.links.length, 6) * 0.5;
+    }
+    if (Array.isArray(candidate.quoted_items) && candidate.quoted_items.length > 0) {
+      score += Math.min(candidate.quoted_items.length, 4) * 1.2;
+    }
+    if (Array.isArray(candidate.status_refs) && candidate.status_refs.length > 0) {
+      score += Math.min(candidate.status_refs.length, 8) * 0.35;
+    }
+    const hints = candidate.context_hints || null;
+    if (hints && typeof hints === "object") {
+      if (hints.social_context) {
+        score += 1.5;
+      }
+      if (hints.section_heading) {
+        score += 0.8;
+      }
+      if (hints.timeline_label) {
+        score += 0.8;
+      }
+    }
+    return score;
+  }
+
+  function rememberBestCandidateByStatus(targetMap, candidate) {
+    if (!targetMap || !candidate || !candidate.status_id) {
+      return;
+    }
+    const current = targetMap.get(candidate.status_id) || null;
+    if (!current) {
+      targetMap.set(candidate.status_id, candidate);
+      return;
+    }
+    if (candidateSignalScore(candidate) > candidateSignalScore(current)) {
+      targetMap.set(candidate.status_id, candidate);
+    }
   }
 
   function collectTweetCandidates(articles) {
@@ -3221,12 +3637,149 @@
     return true;
   }
 
-  async function copyToClipboard(text) {
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-      await navigator.clipboard.writeText(text);
-      return;
+  function getDocumentScrollElement() {
+    return document.scrollingElement || document.documentElement || document.body;
+  }
+
+  function isScrollableElement(node) {
+    if (
+      !node ||
+      typeof node.scrollTop !== "number" ||
+      typeof node.scrollHeight !== "number" ||
+      typeof node.clientHeight !== "number"
+    ) {
+      return false;
+    }
+    if (node.scrollHeight <= node.clientHeight + 4) {
+      return false;
+    }
+    let style = null;
+    try {
+      style = window.getComputedStyle(node);
+    } catch (_error) {
+      return false;
+    }
+    const overflowY = style && style.overflowY ? String(style.overflowY).toLowerCase() : "";
+    return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+  }
+
+  function pickScrollContainer() {
+    const docScroll = getDocumentScrollElement();
+    const firstTweet = document.querySelector(TWEET_SELECTOR);
+    const timelinePattern = /タイムライン|timeline|会話|conversation/i;
+    const candidates = new Set([
+      docScroll,
+      document.documentElement,
+      document.body,
+      document.activeElement,
+      firstTweet,
+      document.querySelector('[aria-label*="タイムライン"]'),
+      document.querySelector('[aria-label*="Timeline"]'),
+      document.querySelector('[data-testid="primaryColumn"]'),
+      document.querySelector('[role="main"]'),
+      document.querySelector("main"),
+    ]);
+
+    for (const seed of Array.from(candidates)) {
+      let probe = seed;
+      let hops = 0;
+      while (probe && hops < 20) {
+        hops += 1;
+        candidates.add(probe);
+        probe = probe.parentElement;
+      }
     }
 
+    const broad = document.querySelectorAll("main,section,div");
+    for (let i = 0; i < broad.length && i < 1600; i += 1) {
+      candidates.add(broad[i]);
+    }
+
+    function scoreScrollableCandidate(node) {
+      const maxScrollableDistance = Math.max(
+        0,
+        (node.scrollHeight || 0) - (node.clientHeight || 0)
+      );
+      let score = maxScrollableDistance;
+      if (node === docScroll || node === document.documentElement || node === document.body) {
+        score += 260;
+      }
+      if (firstTweet && typeof node.contains === "function" && node.contains(firstTweet)) {
+        score += 1200;
+      }
+      if (typeof node.getAttribute === "function") {
+        const testId = node.getAttribute("data-testid");
+        if (testId === "primaryColumn") {
+          score += 420;
+        }
+        const label = node.getAttribute("aria-label");
+        if (label && timelinePattern.test(label)) {
+          score += 520;
+        }
+      }
+      return score;
+    }
+
+    let best = docScroll;
+    let bestScore = isScrollableElement(best)
+      ? scoreScrollableCandidate(best)
+      : -1;
+    for (const node of candidates) {
+      if (!isScrollableElement(node)) {
+        continue;
+      }
+      const score = scoreScrollableCandidate(node);
+      if (score > bestScore) {
+        best = node;
+        bestScore = score;
+      }
+    }
+
+    return best || docScroll;
+  }
+
+  function getScrollTop(container) {
+    if (container && typeof container.scrollTop === "number") {
+      return container.scrollTop;
+    }
+    return window.scrollY || 0;
+  }
+
+  function setScrollTop(container, value) {
+    const next = Number.isFinite(value) ? Math.max(0, value) : 0;
+    if (container && typeof container.scrollTop === "number") {
+      container.scrollTop = next;
+      return;
+    }
+    window.scrollTo(0, next);
+  }
+
+  function scrollByY(container, deltaY) {
+    const amount = Number.isFinite(deltaY) ? deltaY : 0;
+    if (container && typeof container.scrollTop === "number") {
+      container.scrollTop += amount;
+      return;
+    }
+    window.scrollBy(0, amount);
+  }
+
+  function describeScrollContainer(container) {
+    if (!container) {
+      return "unknown";
+    }
+    const docScroll = getDocumentScrollElement();
+    if (container === docScroll || container === document.documentElement || container === document.body) {
+      return "document";
+    }
+    const tag = container.tagName ? String(container.tagName).toLowerCase() : "element";
+    const testId = typeof container.getAttribute === "function" ? container.getAttribute("data-testid") : null;
+    if (testId) {
+      return `${tag}[data-testid=${testId}]`;
+    }
+    return tag;
+  }
+
+  function copyToClipboardWithExecCommand(text) {
     const textarea = document.createElement("textarea");
     textarea.value = text;
     textarea.setAttribute("readonly", "true");
@@ -3238,9 +3791,28 @@
     textarea.select();
     const ok = document.execCommand("copy");
     document.body.removeChild(textarea);
-    if (!ok) {
-      throw new Error("Clipboard copy failed");
+    return ok;
+  }
+
+  async function copyToClipboard(text) {
+    let firstError = null;
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (error) {
+        firstError = error;
+      }
     }
+
+    const copied = copyToClipboardWithExecCommand(text);
+    if (copied) {
+      return;
+    }
+    if (firstError) {
+      throw firstError;
+    }
+    throw new Error("Clipboard copy failed");
   }
 
   function notify(message, level) {
@@ -3287,13 +3859,85 @@
     }
   }
 
+  function relayCaptureViaWindowMessage(payload) {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeoutId = null;
+
+      function finish(response) {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+        }
+        window.removeEventListener("message", onMessage);
+        const ok = Boolean(response && response.ok);
+        const cancelled = Boolean(response && response.cancelled);
+        let error = response && response.error ? String(response.error) : null;
+        if (!ok && !cancelled && !error) {
+          error = "extension_no_response_payload";
+        }
+        resolve({
+          delivered: true,
+          skip_clipboard: ok,
+          result: {
+            ok,
+            cancelled,
+            skip_clipboard: ok,
+            error,
+            transport: response && response.transport ? response.transport : null,
+            tags: response && Array.isArray(response.tags) ? response.tags : null,
+          },
+          error,
+        });
+      }
+
+      function onMessage(event) {
+        if (event.source !== window) {
+          return;
+        }
+        const data = event.data;
+        if (!data || typeof data !== "object") {
+          return;
+        }
+        if (data.source !== RELAY_RESPONSE_SOURCE || data.type !== RELAY_RESPONSE_TYPE) {
+          return;
+        }
+        if (data.request_id !== requestId) {
+          return;
+        }
+        finish(data);
+      }
+
+      timeoutId = window.setTimeout(() => {
+        finish({
+          ok: false,
+          cancelled: false,
+          error: "extension_timeout",
+        });
+      }, DIRECT_RELAY_TIMEOUT_MS);
+
+      window.addEventListener("message", onMessage);
+      window.postMessage(
+        {
+          source: RELAY_REQUEST_SOURCE,
+          type: RELAY_REQUEST_TYPE,
+          request_id: requestId,
+          page_url: window.location.href,
+          payload,
+        },
+        "*"
+      );
+    });
+  }
+
   async function emitCaptureHook(payload, output) {
     const hook = window.__X_CLIPPER_CAPTURE_HOOK__;
     if (typeof hook !== "function") {
-      return {
-        delivered: false,
-        skip_clipboard: false,
-      };
+      return relayCaptureViaWindowMessage(payload);
     }
 
     try {
@@ -3308,6 +3952,7 @@
         delivered: true,
         skip_clipboard: Boolean(result && result.skip_clipboard),
         result: result || null,
+        error: result && result.error ? String(result.error) : null,
       };
     } catch (error) {
       return {
@@ -3318,7 +3963,41 @@
     }
   }
 
+  function acquireRunLock() {
+    const now = Date.now();
+    const current = window[RUN_LOCK_KEY];
+    if (
+      current &&
+      typeof current === "object" &&
+      Number.isFinite(current.started_at) &&
+      now - current.started_at < RUN_LOCK_STALE_MS
+    ) {
+      return null;
+    }
+    const token = {
+      started_at: now,
+      id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
+    };
+    window[RUN_LOCK_KEY] = token;
+    return token;
+  }
+
+  function releaseRunLock(token) {
+    const current = window[RUN_LOCK_KEY];
+    if (!token || !current || token !== current) {
+      return;
+    }
+    delete window[RUN_LOCK_KEY];
+  }
+
   async function run() {
+    const lockToken = acquireRunLock();
+    if (!lockToken) {
+      notify("Capture is already running. Wait for the current capture to finish.");
+      return;
+    }
+
+    try {
     if (!isSupportedCapturePage()) {
       notify(
         'This page is not a tweet detail URL. Open a URL like "https://x.com/<handle>/status/<id>" and run x-clipper again.',
@@ -3329,15 +4008,20 @@
 
     let downProbe = {
       used: false,
+      scroll_container: "unknown",
+      before_scroll_top: 0,
+      after_scroll_top: 0,
       before_count: 0,
       after_count: 0,
+      before_status_count: 0,
+      after_status_count: 0,
       before_reply_count: 0,
       after_reply_count: 0,
+      seen_candidate_count: 0,
+      seen_candidates: [],
     };
-    if ((window.scrollY || 0) <= 24) {
-      const canonicalForDownProbe = getCanonicalStatusId();
-      downProbe = await probeContextByScrollingDownFromTop(canonicalForDownProbe);
-    }
+    const canonicalForDownProbe = getCanonicalStatusId();
+    downProbe = await probeContextByScrollingDownFromTop(canonicalForDownProbe);
 
     let articles = Array.from(document.querySelectorAll(TWEET_SELECTOR));
     if (articles.length === 0) {
@@ -3409,6 +4093,22 @@
     const expectedPrimaryStatusId =
       normalizeStatusId(target && target.statusId) ||
       normalizeStatusId(primaryCandidate && primaryCandidate.status_id);
+    const downProbeCandidates = Array.isArray(downProbe.seen_candidates)
+      ? downProbe.seen_candidates
+      : [];
+    if (expectedPrimaryStatusId) {
+      const probedPrimary =
+        downProbeCandidates.find((item) => item && item.status_id === expectedPrimaryStatusId) ||
+        null;
+      if (
+        probedPrimary &&
+        (!primaryCandidate ||
+          isLowQualityPrimaryCandidate(primaryCandidate, expectedPrimaryStatusId) ||
+          candidateSignalScore(probedPrimary) > candidateSignalScore(primaryCandidate) + 0.6)
+      ) {
+        primaryCandidate = probedPrimary;
+      }
+    }
     let usedTopProbe = false;
     if (isLowQualityPrimaryCandidate(primaryCandidate, expectedPrimaryStatusId)) {
       usedTopProbe = true;
@@ -3440,7 +4140,15 @@
       }
       if (!contextCandidateMap.has(item.status_id)) {
         contextCandidateMap.set(item.status_id, item);
+      } else {
+        rememberBestCandidateByStatus(contextCandidateMap, item);
       }
+    }
+    for (const item of downProbeCandidates) {
+      if (!item || !item.status_id || item.status_id === primaryCandidate.status_id) {
+        continue;
+      }
+      rememberBestCandidateByStatus(contextCandidateMap, item);
     }
 
     const contextCandidateList = Array.from(contextCandidateMap.values());
@@ -3515,19 +4223,35 @@
       return;
     }
 
-    if (relay.delivered && relay.error) {
-      notify(`Extension relay failed: ${relay.error}. Falling back to clipboard copy.`, "error");
-    }
     if (relay.delivered && relay.skip_clipboard) {
       const selectedTags =
         relay.result && Array.isArray(relay.result.tags) ? relay.result.tags : [];
       const tagSuffix = selectedTags.length > 0 ? `, tags=${selectedTags.join(",")}` : "";
-      const probeSuffix = downProbe.used
-        ? `, auto_scroll=${downProbe.before_count}->${downProbe.after_count}, auto_replies=${downProbe.before_reply_count}->${downProbe.after_reply_count}`
-        : "";
+      const probeSuffix =
+        `, auto_scroll_top=${downProbe.before_scroll_top}->${downProbe.after_scroll_top}` +
+        `, auto_articles=${downProbe.before_count}->${downProbe.after_count}` +
+        `, auto_statuses=${downProbe.before_status_count}->${downProbe.after_status_count}` +
+        `, auto_replies=${downProbe.before_reply_count}->${downProbe.after_reply_count}` +
+        `, auto_seen_candidates=${downProbe.seen_candidate_count}` +
+        `, auto_container=${downProbe.scroll_container}`;
       notify(
         `Captured via extension relay. status_id=${payload.tweet.status_id}, context_tweets=${payload.context_tweets.length}${tagSuffix}${probeSuffix}`
       );
+      return;
+    }
+
+    if (relay.delivered) {
+      const relayResultError =
+        relay.result && relay.result.error ? String(relay.result.error) : null;
+      const relayMessage = relay.error || relayResultError || "extension_relay_failed";
+      if (isRuntimeUnavailableRelayError(relayMessage)) {
+        notify(
+          "Extension relay failed: runtime_unavailable. Reload this X tab once and retry.",
+          "error"
+        );
+        return;
+      }
+      notify(`Extension relay failed: ${relayMessage}`, "error");
       return;
     }
 
@@ -3560,6 +4284,9 @@
       } catch (_error) {
         // ignore
       }
+    }
+    } finally {
+      releaseRunLock(lockToken);
     }
   }
 

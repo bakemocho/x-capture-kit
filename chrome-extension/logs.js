@@ -28,6 +28,7 @@ const state = {
   hasMore: false,
   loading: false,
   knownTags: [],
+  tagSuggestionRefreshers: new Set(),
 };
 
 function $(id) {
@@ -187,10 +188,63 @@ function readEdgeCounts(capture) {
   };
 }
 
+function areTagArraysEqual(left, right) {
+  const a = Array.isArray(left) ? left : [];
+  const b = Array.isArray(right) ? right : [];
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function mergeKnownTags(rawTags) {
   const incoming = normalizeTags(rawTags, MAX_KNOWN_TAGS);
-  const merged = normalizeTags([...(state.knownTags || []), ...incoming], MAX_KNOWN_TAGS);
+  if (incoming.length === 0) {
+    return false;
+  }
+  const prior = normalizeTags(state.knownTags || [], MAX_KNOWN_TAGS);
+  const merged = [];
+  const seen = new Set();
+  for (const tag of incoming) {
+    if (seen.has(tag)) {
+      continue;
+    }
+    seen.add(tag);
+    merged.push(tag);
+    if (merged.length >= MAX_KNOWN_TAGS) {
+      break;
+    }
+  }
+  if (merged.length < MAX_KNOWN_TAGS) {
+    for (const tag of prior) {
+      if (seen.has(tag)) {
+        continue;
+      }
+      seen.add(tag);
+      merged.push(tag);
+      if (merged.length >= MAX_KNOWN_TAGS) {
+        break;
+      }
+    }
+  }
+  const changed = !areTagArraysEqual(state.knownTags || [], merged);
   state.knownTags = merged;
+  return changed;
+}
+
+function refreshTagSuggestionViews() {
+  for (const refresh of Array.from(state.tagSuggestionRefreshers || [])) {
+    try {
+      refresh();
+    } catch (_error) {
+      state.tagSuggestionRefreshers.delete(refresh);
+    }
+  }
 }
 
 async function loadKnownTagsFromOptions() {
@@ -238,6 +292,18 @@ function formatStatusIdLabel(statusId, tweetsById) {
     return `status:${statusId.slice(-6)}`;
   }
   return formatTweetLabel(tweet);
+}
+
+function formatCaptureNodeLabel(node) {
+  if (!node || typeof node !== "object") {
+    return "(unknown capture)";
+  }
+  const author = node.author && typeof node.author === "object" ? node.author : {};
+  const authorLabel = author.display_name || author.handle_text || author.handle || "unknown";
+  const statusId = node.primary_status_id ? String(node.primary_status_id) : "";
+  const statusLabel = statusId ? `#${statusId.slice(-6)}` : "#------";
+  const capturedAt = node.captured_at ? formatDateTime(node.captured_at) : "-";
+  return `${authorLabel} ${statusLabel} | ${capturedAt}`;
 }
 
 function createMetricPillRow(metrics) {
@@ -893,6 +959,7 @@ function createGraphPanel(graph) {
 
   const tweets = Array.isArray(graph && graph.tweets) ? graph.tweets : [];
   const edges = Array.isArray(graph && graph.edges) ? graph.edges : [];
+  const captureEdges = Array.isArray(graph && graph.capture_edges) ? graph.capture_edges : [];
   const tweetsById = new Map();
   for (const tweet of tweets) {
     if (tweet && tweet.status_id) {
@@ -910,7 +977,7 @@ function createGraphPanel(graph) {
 
   const header = document.createElement("div");
   header.className = "graph-header";
-  header.textContent = `Graph: tweets ${tweets.length}, edges ${edges.length}`;
+  header.textContent = `Graph: tweets ${tweets.length}, edges ${edges.length}, cross-capture ${captureEdges.length}`;
   wrap.append(header);
 
   const timelineDetails = document.createElement("details");
@@ -1056,6 +1123,54 @@ function createGraphPanel(graph) {
   }
 
   wrap.append(edgeDetails);
+
+  const captureEdgeDetails = document.createElement("details");
+  captureEdgeDetails.className = "graph-related";
+  const captureEdgeSummary = document.createElement("summary");
+  captureEdgeSummary.textContent = `Cross-capture edges (${captureEdges.length})`;
+  captureEdgeDetails.append(captureEdgeSummary);
+
+  if (captureEdges.length === 0) {
+    const emptyCross = document.createElement("p");
+    emptyCross.className = "graph-empty";
+    emptyCross.textContent = "No cross-capture edges linked to this capture.";
+    captureEdgeDetails.append(emptyCross);
+  } else {
+    const list = document.createElement("ul");
+    list.className = "edge-list";
+    const currentCaptureId = Number(graph && graph.capture && graph.capture.id);
+
+    for (const relation of captureEdges) {
+      const item = document.createElement("li");
+      item.className = "edge-item";
+
+      const srcCaptureId = Number(relation && relation.src_capture_id);
+      const dstCaptureId = Number(relation && relation.dst_capture_id);
+      const outgoing = Number.isFinite(currentCaptureId) && srcCaptureId === currentCaptureId;
+      const fromCapture = outgoing ? relation.src_capture : relation.dst_capture;
+      const toCapture = outgoing ? relation.dst_capture : relation.src_capture;
+      const direction = outgoing ? "->" : "<-";
+
+      const arrow = document.createElement("span");
+      arrow.className = "edge-arrow";
+      arrow.textContent = direction;
+
+      const text = document.createElement("span");
+      text.className = "edge-text";
+      text.textContent = `Capture #${srcCaptureId} -> #${dstCaptureId} | ${
+        relation && relation.edge_type ? relation.edge_type : "unknown"
+      } | ${relation && relation.src_status_id ? relation.src_status_id : "-"} -> ${
+        relation && relation.dst_status_id ? relation.dst_status_id : "-"
+      } | ${formatCaptureNodeLabel(fromCapture)} => ${formatCaptureNodeLabel(toCapture)}`;
+
+      item.append(arrow, text);
+      list.append(item);
+    }
+
+    captureEdgeDetails.append(list);
+  }
+
+  wrap.append(captureEdgeDetails);
   return wrap;
 }
 
@@ -1259,6 +1374,15 @@ function createCaptureCard(capture) {
     renderTagAutocomplete();
   }
 
+  const refreshTagUi = () => {
+    if (!document.body.contains(card)) {
+      state.tagSuggestionRefreshers.delete(refreshTagUi);
+      return;
+    }
+    renderTagSuggestions();
+  };
+  state.tagSuggestionRefreshers.add(refreshTagUi);
+
   renderTagSuggestions();
   tagsInput.addEventListener("input", () => {
     autocompleteOpen = true;
@@ -1267,7 +1391,7 @@ function createCaptureCard(capture) {
   });
   tagsInput.addEventListener("focus", () => {
     autocompleteOpen = true;
-    renderTagAutocomplete();
+    renderTagSuggestions();
   });
   tagsInput.addEventListener("blur", () => {
     window.setTimeout(() => {
@@ -1390,10 +1514,15 @@ function createCaptureCard(capture) {
       archiveToggle.checked = capture.is_archived;
       card.classList.toggle("archived", capture.is_archived);
 
-      mergeKnownTags(capture.tags || []);
-      renderTagSuggestions();
+      const knownTagsChanged = mergeKnownTags(capture.tags || []);
+      if (knownTagsChanged) {
+        refreshTagSuggestionViews();
+      } else {
+        renderTagSuggestions();
+      }
 
       if (!state.includeArchived && capture.is_archived) {
+        state.tagSuggestionRefreshers.delete(refreshTagUi);
         card.remove();
         setStatus(`Capture #${capture.id} archived and hidden (include archived is off).`, false);
       }
@@ -1432,6 +1561,7 @@ function createCaptureCard(capture) {
           capture: result.capture || null,
           tweets: Array.isArray(result.tweets) ? result.tweets : [],
           edges: Array.isArray(result.edges) ? result.edges : [],
+          capture_edges: Array.isArray(result.capture_edges) ? result.capture_edges : [],
         };
 
         graphPanel.innerHTML = "";
@@ -1475,6 +1605,7 @@ function createCaptureCard(capture) {
 
 function renderCaptures() {
   const root = $("listRoot");
+  state.tagSuggestionRefreshers.clear();
   root.innerHTML = "";
 
   if (!Array.isArray(state.captures) || state.captures.length === 0) {

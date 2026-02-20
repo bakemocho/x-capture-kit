@@ -4,7 +4,7 @@ X (Twitter) capture toolkit for three runtimes:
 
 - Legacy bookmarklet
 - Chrome extension (MV3)
-- Safari extension (planned)
+- Safari extension (converter-based project)
 
 This repository is intentionally productized and detached from any private project history.
 
@@ -19,7 +19,7 @@ This repository is intentionally productized and detached from any private proje
 
 - Primary runtime: Chrome extension (MV3) for day-to-day capture workflow.
 - Legacy bookmarklet: fallback for restricted environments and quick manual validation.
-- Safari: planned extension; until then, use the bookmarklet path in Safari.
+- Safari: available via converter-generated Xcode project (`safari-extension/README.md`).
 
 ## Operating Model
 
@@ -37,9 +37,10 @@ Capture runs only when explicitly invoked by the user.
 - `core/x-clipper.js`: shared capture logic
 - `scripts/build-bookmarklet.js`: builds 1-line bookmarklet URL from `core/x-clipper.js`
 - `scripts/sync-extension-clipper.js`: syncs `core/x-clipper.js` into Chrome extension runtime file
+- `scripts/build-safari-extension.sh`: generates/refreshes Safari extension Xcode project
 - `chrome-extension/`: MV3 extension
 - `bookmarklet/`: bookmarklet notes
-- `safari-extension/`: planning notes and upcoming implementation
+- `safari-extension/`: Safari runbook + generated project output
 
 ## Quick Start
 
@@ -55,6 +56,12 @@ Sync core to extension runtime:
 node scripts/sync-extension-clipper.js
 ```
 
+Generate/refresh Safari project:
+
+```bash
+./scripts/build-safari-extension.sh
+```
+
 Load Chrome extension:
 
 1. Open `chrome://extensions`
@@ -66,6 +73,7 @@ Load Chrome extension:
 
 - Default collector endpoint is `http://127.0.0.1:18765/ingest`.
 - Tag defaults are generic (`research`) and can be changed in options.
+- Safari local debug requires `Develop -> Allow Unsigned Extensions`.
 
 ## Legal
 

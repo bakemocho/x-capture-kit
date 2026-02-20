@@ -20,6 +20,14 @@
           <span>Ingest Token (optional)</span>
           <input id="ingestToken" type="password" placeholder="token" />
         </label>
+        <p class="help">
+          Failed relay payloads are queued automatically. Use flush after collector recovery.
+        </p>
+        <div class="inline-actions">
+          <button id="flushRetryButton" type="button" class="secondary">Flush Retry Queue</button>
+          <button id="refreshRetryButton" type="button" class="secondary">Refresh Queue</button>
+          <span id="retryQueueInfo" class="inline-info"></span>
+        </div>
       </section>
 
       <section class="card">
@@ -44,9 +52,8 @@
       <footer class="actions">
         <button id="saveButton" type="button">Save</button>
         <button id="resetButton" type="button" class="secondary">Reset</button>
-        <a href="logs.html" target="_blank" rel="noopener noreferrer" class="button-link secondary"
-          >Open Logs</a
-        >
+        <button id="openLogsButton" type="button" class="secondary">Open Logs</button>
+        <button id="openCollectorButton" type="button" class="secondary">Open Collector</button>
         <span id="statusMessage" role="status" aria-live="polite"></span>
       </footer>
     </main>
